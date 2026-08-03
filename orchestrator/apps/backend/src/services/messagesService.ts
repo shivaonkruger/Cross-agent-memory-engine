@@ -34,20 +34,20 @@ export async function insertMessage(params: {
   return toChatMessage(result.rows[0]!);
 }
 
-export async function getRecentMessagesForAgent(
+export async function getMessagesAfter(
   sessionId: string,
   agent: Agent,
-  limit: number
+  afterMessageId: string | null
 ): Promise<ChatMessage[]> {
   const result = await pool.query<MessageRow>(
     `SELECT id, agent, role, content, created_at
      FROM messages
      WHERE session_id = $1 AND agent = $2
-     ORDER BY created_at DESC
-     LIMIT $3`,
-    [sessionId, agent, limit]
+       AND ($3::uuid IS NULL OR created_at > (SELECT created_at FROM messages WHERE id = $3::uuid))
+     ORDER BY created_at ASC`,
+    [sessionId, agent, afterMessageId]
   );
-  return result.rows.map(toChatMessage).reverse();
+  return result.rows.map(toChatMessage);
 }
 
 export async function getSessionMessages(sessionId: string): Promise<ChatMessage[]> {

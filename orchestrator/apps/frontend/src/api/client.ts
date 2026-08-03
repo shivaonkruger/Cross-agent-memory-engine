@@ -1,4 +1,5 @@
 import type {
+  Agent,
   Session,
   ChatMessage,
   SendMessageRequest,
@@ -28,6 +29,11 @@ export async function listSessions(): Promise<Session[]> {
 export async function getSessionMessages(sessionId: string): Promise<ChatMessage[]> {
   const res = await fetch(`${BASE_URL}/api/sessions/${sessionId}/messages`);
   return handleResponse<ChatMessage[]>(res);
+}
+
+export async function getActiveModels(): Promise<Record<Agent, string>> {
+  const res = await fetch(`${BASE_URL}/api/config/active-models`);
+  return handleResponse<Record<Agent, string>>(res);
 }
 
 export async function sendAgentMessage(

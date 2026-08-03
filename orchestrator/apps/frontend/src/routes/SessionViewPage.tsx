@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
-import { getSessionMessages } from "../api/client";
+import { getSessionMessages, getActiveModels } from "../api/client";
 import { AgentPanel } from "../components/AgentPanel";
 import type { Agent, ChatMessage } from "../types/shared";
 
@@ -11,6 +11,7 @@ export function SessionViewPage() {
   const [messagesByAgent, setMessagesByAgent] = useState<Record<Agent, ChatMessage[]> | null>(
     null
   );
+  const [activeModels, setActiveModels] = useState<Record<Agent, string> | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -26,6 +27,10 @@ export function SessionViewPage() {
         setMessagesByAgent(grouped);
       })
       .catch((err) => setError(err instanceof Error ? err.message : "Failed to load session"));
+
+    getActiveModels()
+      .then(setActiveModels)
+      .catch(() => setActiveModels(null));
   }, [sessionId]);
 
   if (!sessionId) {
@@ -48,6 +53,7 @@ export function SessionViewPage() {
           agent={agent}
           sessionId={sessionId}
           initialMessages={messagesByAgent[agent]}
+          activeModel={activeModels?.[agent]}
         />
       ))}
     </div>

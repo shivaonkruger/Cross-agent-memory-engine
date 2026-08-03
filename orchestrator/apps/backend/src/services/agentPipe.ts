@@ -1,7 +1,9 @@
 import { getOpenrouterClient } from "../lib/openrouterClient";
 import { MODELS } from "../config/models";
 import { withRetry, isRetryableOpenRouterError } from "../utils/retry";
-import { insertMessage, getRecentMessagesForAgent } from "./messagesService";
+import { insertMessage } from "./messagesService";
+import { getAgentConversationContext } from "./conversationMemory";
+import { buildEnrichedSystemPrompt } from "./contextInjector";
 import type { Agent } from "../types/shared";
 
 export async function sendAgentMessage(
@@ -10,19 +12,36 @@ export async function sendAgentMessage(
   message: string
 ): Promise<{ responseText: string }> {
   try {
+    // Fetched BEFORE inserting this turn's user message, so the recency
+    // window/summary reflect prior turns only — the current message is
+    // appended once, explicitly, below. (Fetching after the insert would
+    // double it up, since it would already be in the "uncovered" set.)
+    console.log(`[agentPipe] session=${sessionId} agent=${agent} step=fetch_conversation_context`);
+    const { summary, recentMessages } = await getAgentConversationContext(sessionId, agent);
+
+    console.log(`[agentPipe] session=${sessionId} agent=${agent} step=build_system_prompt`);
+    const systemPrompt = await buildEnrichedSystemPrompt(sessionId, agent);
+
+    const conversationSummarySection = summary
+      ? `\n\n[YOUR CONVERSATION SO FAR WITH THE USER]\n${summary}`
+      : "";
+    const finalSystemPrompt = systemPrompt + conversationSummarySection;
+    console.log(
+      `[agentPipe] session=${sessionId} agent=${agent} step=system_prompt_built\n${finalSystemPrompt}`
+    );
+
+    console.log(
+      `agentPipe: using recency window of ${recentMessages.length} messages + summary of length ${summary.length} for session ${sessionId}, agent ${agent}`
+    );
+
     console.log(`[agentPipe] session=${sessionId} agent=${agent} step=insert_user_message`);
     await insertMessage({ sessionId, agent, role: "user", content: message });
 
-    console.log(`[agentPipe] session=${sessionId} agent=${agent} step=fetch_history`);
-    const history = await getRecentMessagesForAgent(sessionId, agent, 20);
-    console.log(
-      `[agentPipe] session=${sessionId} agent=${agent} step=fetch_history count=${history.length}`
-    );
-
-    const openrouterMessages = history.map((m) => ({
-      role: m.role,
-      content: m.content,
-    }));
+    const openrouterMessages = [
+      { role: "system" as const, content: finalSystemPrompt },
+      ...recentMessages,
+      { role: "user" as const, content: message },
+    ];
 
     console.log(`[agentPipe] session=${sessionId} agent=${agent} step=call_openrouter model=${MODELS[agent]}`);
     const completion = await withRetry(

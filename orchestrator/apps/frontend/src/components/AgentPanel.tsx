@@ -13,9 +13,10 @@ interface AgentPanelProps {
   agent: Agent;
   sessionId: string;
   initialMessages: ChatMessage[];
+  activeModel?: string;
 }
 
-export function AgentPanel({ agent, sessionId, initialMessages }: AgentPanelProps) {
+export function AgentPanel({ agent, sessionId, initialMessages, activeModel }: AgentPanelProps) {
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
   const [input, setInput] = useState("");
   const [pending, setPending] = useState(false);
@@ -65,6 +66,9 @@ export function AgentPanel({ agent, sessionId, initialMessages }: AgentPanelProp
         <span className="font-mono text-xs uppercase tracking-wide text-muted">
           {AGENT_LABELS[agent]}
         </span>
+        {activeModel && (
+          <div className="font-mono text-[11px] text-muted/70 mt-0.5">using: {activeModel}</div>
+        )}
       </div>
 
       <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-2">

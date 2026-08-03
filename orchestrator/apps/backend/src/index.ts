@@ -3,6 +3,7 @@ import express from "express";
 import cors from "cors";
 import { sessionsRouter } from "./routes/sessions";
 import { agentsRouter } from "./routes/agents";
+import { configRouter } from "./routes/config";
 
 const app = express();
 
@@ -11,6 +12,7 @@ app.use(express.json());
 
 app.use("/api/sessions", sessionsRouter);
 app.use("/api/agents", agentsRouter);
+app.use("/api/config", configRouter);
 
 app.listen(env.PORT, () => {
   console.log(`[backend] listening on port ${env.PORT}`);
