@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { createSession, listSessions } from "../api/client";
 import { SessionListItem } from "../components/SessionListItem";
+import { useAuth } from "../context/AuthContext";
 import type { Session } from "../types/shared";
 
 export function SessionListPage() {
@@ -9,6 +10,7 @@ export function SessionListPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const navigate = useNavigate();
+  const { user, signOut } = useAuth();
 
   useEffect(() => {
     listSessions()
@@ -36,6 +38,13 @@ export function SessionListPage() {
           className="bg-primary text-surface rounded-sm px-4 py-2 text-sm"
         >
           New session
+        </button>
+      </div>
+
+      <div className="flex items-center justify-between mb-8 text-sm text-muted">
+        <span>{user?.email}</span>
+        <button type="button" onClick={signOut} className="underline hover:text-foreground">
+          Sign out
         </button>
       </div>
 

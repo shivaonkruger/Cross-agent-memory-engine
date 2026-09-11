@@ -18,4 +18,8 @@ export const env = {
   // scripts like the migration runner load this module but never call OpenRouter.
   OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY ?? "",
   CORS_ORIGIN: process.env.CORS_ORIGIN ?? "http://localhost:5173",
+  // Validated lazily by services/authService.ts on first use, not here — same
+  // reasoning as OPENROUTER_API_KEY above.
+  JWT_SECRET: process.env.JWT_SECRET ?? "",
+  JWT_EXPIRES_IN: process.env.JWT_EXPIRES_IN ?? "7d",
 };
