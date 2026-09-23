@@ -28,10 +28,20 @@ interface LongTermMemoryRow {
   settled_facts: string[];
 }
 
+export interface MemoryRows {
+  shortTerm: ShortTermMemoryRow | undefined;
+  longTerm: LongTermMemoryRow | undefined;
+}
+
 // Full injection only — no cursors, no delta. Every call re-fetches the
 // complete current short_term_memory and long_term_memory rows for this
 // session. Delta injection was deliberately dropped from this project.
-export async function buildEnrichedSystemPrompt(sessionId: string, agent: Agent): Promise<string> {
+//
+// Shared by buildEnrichedSystemPrompt below AND by the classifier (via
+// agentPipe.ts), which needs the same recentEvents/pendingQuestions/
+// settledFacts to build its own prompt — extracted here so the query logic
+// isn't duplicated between the two call sites.
+export async function fetchMemoryRows(sessionId: string): Promise<MemoryRows> {
   const [shortTermResult, longTermResult] = await Promise.all([
     pool.query<ShortTermMemoryRow>(
       "SELECT event_window, agent_states, pending_questions FROM short_term_memory WHERE session_id = $1",
@@ -43,8 +53,11 @@ export async function buildEnrichedSystemPrompt(sessionId: string, agent: Agent)
     ),
   ]);
 
-  const shortTerm = shortTermResult.rows[0];
-  const longTerm = longTermResult.rows[0];
+  return { shortTerm: shortTermResult.rows[0], longTerm: longTermResult.rows[0] };
+}
+
+export async function buildEnrichedSystemPrompt(sessionId: string, agent: Agent): Promise<string> {
+  const { shortTerm, longTerm } = await fetchMemoryRows(sessionId);
 
   const sections: string[] = [];
 
@@ -96,16 +109,34 @@ export async function buildEnrichedSystemPrompt(sessionId: string, agent: Agent)
     "Build on their findings. Do not duplicate their work.",
   ].join("\n");
 
+  // ALWAYS present, regardless of what memory exists (even a completely
+  // fresh session with no memory at all) — unlike the sections above, this
+  // is an instruction to the model, not context data, so it is never
+  // conditionally omitted.
   const eventCandidateInstructions = [
-    "When your response contains a decision, finding, question, blocker,",
-    "contradiction, output, or handoff — append this block:",
+    "When your response contains any of the following — a new finding, a",
+    "decision with reasoning, a question that needs an answer from another",
+    "agent or the user, something blocking progress, a direct contradiction",
+    "with something previously established, a concrete artifact you",
+    "produced, or a handoff to another agent — append EXACTLY ONE block like",
+    "this at the very end of your response, after your normal answer:",
     "",
     "[EVENT_CANDIDATE]",
-    "type: ...",
-    "summary: ...",
-    "confidence: high|medium|low",
-    "resolves: evt_XXXX (only if answering an open question)",
+    "type: FINDING | DECISION | QUESTION | BLOCKER | CONTRADICTION | OUTPUT | HANDOFF",
+    "summary: one sentence describing what happened",
+    "confidence: high | medium | low",
+    "resolves: evt_XXXXXXXX",
     "[/EVENT_CANDIDATE]",
+    "",
+    "Only include the 'resolves' line if your response directly answers one",
+    "of the open questions listed above (use its exact event ID). Omit the",
+    "'resolves' line entirely otherwise — do not write 'resolves: none' or",
+    "leave it blank, just don't include that line at all.",
+    "",
+    "If your response is a normal reply that doesn't represent any of the",
+    "above (a clarifying question back to the user, small talk, an",
+    "acknowledgment, routine conversation), do NOT include this block at",
+    "all. Do not force one when there is nothing meaningful to report.",
   ].join("\n");
 
   const blocks = [

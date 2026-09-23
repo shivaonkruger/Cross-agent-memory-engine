@@ -1,10 +1,11 @@
-import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { pool } from "../db/pool";
 import { env } from "../config/env";
 import type { AuthResponse, User } from "../types/shared";
 
-const SALT_ROUNDS = 10;
+// TEMPORARY (testing only): passwords are stored and compared as plaintext.
+// Hashing (bcrypt) was deliberately pulled out to simplify testing and is
+// meant to be reintroduced before this goes anywhere near real users.
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export class AuthError extends Error {
@@ -55,10 +56,9 @@ export async function signUp(rawEmail: unknown, rawPassword: unknown): Promise<A
     throw new AuthError("An account with that email already exists", 409);
   }
 
-  const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
   const result = await pool.query<{ id: string; email: string; created_at: Date }>(
     "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, email, created_at",
-    [email, passwordHash]
+    [email, password]
   );
 
   const user = toUser(result.rows[0]!);
@@ -83,8 +83,7 @@ export async function signIn(rawEmail: unknown, rawPassword: unknown): Promise<A
     throw new AuthError("Invalid email or password", 401);
   }
 
-  const valid = await bcrypt.compare(rawPassword, row.password_hash);
-  if (!valid) {
+  if (rawPassword !== row.password_hash) {
     throw new AuthError("Invalid email or password", 401);
   }
 

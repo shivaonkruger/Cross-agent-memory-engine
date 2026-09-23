@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { sendAgentMessage } from "../services/agentPipe";
+import { getSessionOwnerId } from "../services/sessionsService";
 import type { Agent } from "../types/shared";
 
 export const agentsRouter = Router();
@@ -23,6 +24,15 @@ agentsRouter.post("/message", async (req, res) => {
   }
 
   try {
+    // Same not-found-vs-not-yours ambiguity as GET /:sessionId/messages —
+    // a sessionId in this body could otherwise be used to talk into a
+    // session that isn't the caller's.
+    const ownerId = await getSessionOwnerId(sessionId);
+    if (!ownerId || ownerId !== req.userId) {
+      res.status(404).json({ error: "Session not found" });
+      return;
+    }
+
     const result = await sendAgentMessage(sessionId, agent as Agent, message);
     res.json(result);
   } catch (err) {

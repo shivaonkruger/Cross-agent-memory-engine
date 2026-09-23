@@ -3,7 +3,10 @@ import { MODELS } from "../config/models";
 import { withRetry, isRetryableOpenRouterError } from "../utils/retry";
 import { insertMessage } from "./messagesService";
 import { getAgentConversationContext } from "./conversationMemory";
-import { buildEnrichedSystemPrompt } from "./contextInjector";
+import { buildEnrichedSystemPrompt, fetchMemoryRows } from "./contextInjector";
+import { parseAgentResponse } from "./responseParser";
+import { classifyEvent } from "./classifier";
+import { writeEvent } from "./eventWriter";
 import type { Agent } from "../types/shared";
 
 export async function sendAgentMessage(
@@ -54,13 +57,47 @@ export async function sendAgentMessage(
       { retries: 2, delayMs: 1000, shouldRetry: isRetryableOpenRouterError }
     );
 
-    const responseText = completion.choices[0]?.message?.content ?? "";
+    const rawResponseText = completion.choices[0]?.message?.content ?? "";
     console.log(`[agentPipe] session=${sessionId} agent=${agent} step=call_openrouter done`);
 
-    console.log(`[agentPipe] session=${sessionId} agent=${agent} step=insert_assistant_message`);
-    await insertMessage({ sessionId, agent, role: "assistant", content: responseText });
+    console.log(`[agentPipe] session=${sessionId} agent=${agent} step=parse_response`);
+    const { cleanText, candidate } = parseAgentResponse(rawResponseText);
 
-    return { responseText };
+    // Classifier/event-write are a side channel into shared memory — never
+    // let either block or fail the user's actual response. Any failure here
+    // is logged and swallowed; the reply below still goes out normally.
+    try {
+      console.log(`[agentPipe] session=${sessionId} agent=${agent} step=classify_event`);
+      const { shortTerm, longTerm } = await fetchMemoryRows(sessionId);
+      const classifierResult = await classifyEvent({
+        agentName: agent,
+        candidate,
+        agentResponseText: cleanText,
+        sessionContext: {
+          recentEvents: shortTerm?.event_window ?? [],
+          pendingQuestions: shortTerm?.pending_questions ?? [],
+          settledFacts: longTerm?.settled_facts ?? [],
+        },
+      });
+
+      if (classifierResult.emit && classifierResult.event) {
+        await writeEvent(sessionId, agent, classifierResult.event);
+      } else {
+        console.log(
+          `[agentPipe] session=${sessionId} agent=${agent} step=classify_event no-op reason=${classifierResult.rejectionReason ?? "n/a"}`
+        );
+      }
+    } catch (err) {
+      console.error(
+        `[agentPipe] session=${sessionId} agent=${agent} step=classify_event failed (non-fatal, response still sent)`,
+        err
+      );
+    }
+
+    console.log(`[agentPipe] session=${sessionId} agent=${agent} step=insert_assistant_message`);
+    await insertMessage({ sessionId, agent, role: "assistant", content: cleanText });
+
+    return { responseText: cleanText };
   } catch (err) {
     console.error(`[agentPipe] session=${sessionId} agent=${agent} step=failed`, err);
     throw err;
