@@ -431,6 +431,54 @@ to a paid model instead of erroring.
 
 ---
 
+## Phase 9 — Markdown rendering for chat messages (frontend)
+
+**Goal**: agent responses often come back as markdown (bold labels,
+numbered/nested lists, etc.), but the chat UI was rendering
+`message.content` as raw text — so replies showed literal `**text**`
+and `1. 2. 3.` characters instead of actual formatting.
+
+**What was built**:
+- `MessageBubble.tsx` rewritten to render `message.content` through
+  `react-markdown` (+ `remark-gfm` for GFM tables/strikethrough/
+  autolinks) instead of dumping it as plain text
+- A `components` prop mapping styled for chat-bubble scale (not
+  full-page prose): paragraphs, bold/italic, ordered/unordered lists,
+  h1–h3, blockquotes, hr, inline code, code blocks, links, GFM tables
+- Inline code / code blocks use `bg-current/10` (keyed off
+  `currentColor`) rather than a fixed shade — the user bubble is dark
+  text-on-light and the assistant bubble is the reverse, so a fixed
+  tint would vanish on one of them
+- New deps: `react-markdown`, `remark-gfm` (apps/frontend/package.json)
+
+**Key decisions**:
+- Presentation-only fix — `message.content` itself is unchanged in the
+  DB/API; only how the frontend displays it changed
+- Hand-styled `components` overrides instead of pulling in
+  `@tailwindcss/typography` — keeps styling scoped to chat-bubble scale
+  rather than inheriting that plugin's full prose defaults
+
+**Verified**: frontend `tsc --noEmit` and `oxlint` clean; `vite build`
+succeeded, and grepping the built CSS confirmed `bg-current/10` emitted
+real `currentColor`-based rules rather than being silently dropped as
+an unrecognized class. First verification pass was incomplete — user
+reported the change didn't appear to do anything; confirmed via curl
+that the running dev server was in fact serving the updated module
+(ruled out a stale/unbuilt server), which pointed at a stale browser
+tab from before the new deps triggered Vite's dependency
+re-optimization. User then hard-refreshed and confirmed in the browser
+that bold text and numbered/nested lists now render correctly instead
+of showing raw markdown syntax — that confirmation is what this entry
+is logged against, not the earlier build/lint checks alone.
+
+**Deferred at this stage**: no syntax highlighting for code blocks
+(plain monospace only); react-markdown's default-safe rendering (no
+raw HTML passthrough) is relied on as-is, not separately re-verified
+against adversarial input; not tested against very large tables or
+deeply nested lists.
+
+---
+
 ## Next up (not yet built — do not treat as done)
 
 Compression engine / tiering system. `events.tier` and

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { createSession, listSessions } from "../api/client";
+import { createSession, deleteSession, listSessions } from "../api/client";
 import { SessionListItem } from "../components/SessionListItem";
 import { useAuth } from "../context/AuthContext";
 import type { Session } from "../types/shared";
@@ -25,6 +25,20 @@ export function SessionListPage() {
       navigate(`/session/${session.sessionId}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create session");
+    }
+  }
+
+  async function handleDeleteSession(sessionId: string) {
+    // Deletion is soft (deleted_at) server-side, but there's no undo in the
+    // UI, so confirm before it disappears from the list.
+    if (!window.confirm("Delete this session? This can't be undone from here.")) {
+      return;
+    }
+    try {
+      await deleteSession(sessionId);
+      setSessions((prev) => prev.filter((s) => s.sessionId !== sessionId));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to delete session");
     }
   }
 
@@ -57,7 +71,11 @@ export function SessionListPage() {
       ) : (
         <div className="flex flex-col gap-2">
           {sessions.map((session) => (
-            <SessionListItem key={session.sessionId} session={session} />
+            <SessionListItem
+              key={session.sessionId}
+              session={session}
+              onDelete={handleDeleteSession}
+            />
           ))}
         </div>
       )}

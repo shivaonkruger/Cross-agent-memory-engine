@@ -52,3 +52,17 @@ export async function getSessionOwnerId(sessionId: string): Promise<string | nul
   );
   return result.rows[0]?.user_id ?? null;
 }
+
+/**
+ * Soft-deletes a session (sets deleted_at) — only if it exists, isn't
+ * already deleted, and is owned by userId. Returns true if a row was
+ * actually updated, false otherwise (not found / not yours / already gone),
+ * so the route can tell those apart from a real failure.
+ */
+export async function deleteSession(sessionId: string, userId: string): Promise<boolean> {
+  const result = await pool.query(
+    "UPDATE sessions SET deleted_at = NOW() WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+    [sessionId, userId]
+  );
+  return (result.rowCount ?? 0) > 0;
+}

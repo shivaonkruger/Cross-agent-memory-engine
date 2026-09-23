@@ -107,6 +107,7 @@ export async function buildEnrichedSystemPrompt(sessionId: string, agent: Agent)
     "[YOUR ROLE]",
     `You are ${AGENT_LABELS[agent]}. Your co-agents are ${others.join(", ")}.`,
     "Build on their findings. Do not duplicate their work.",
+    "Do not use emojis in your responses.",
   ].join("\n");
 
   // ALWAYS present, regardless of what memory exists (even a completely

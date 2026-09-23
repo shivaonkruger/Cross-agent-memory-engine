@@ -80,6 +80,16 @@ export async function getSessionMessages(sessionId: string): Promise<ChatMessage
   return handleResponse<ChatMessage[]>(res);
 }
 
+export async function deleteSession(sessionId: string): Promise<void> {
+  const res = await authedFetch(`/api/sessions/${sessionId}`, { method: "DELETE" });
+  // 204 No Content on success — handleResponse's res.json() would throw on
+  // the empty body, so success just needs the ok check, not a parsed body.
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error ?? `Request failed with status ${res.status}`);
+  }
+}
+
 export async function getActiveModels(): Promise<Record<Agent, string>> {
   const res = await authedFetch("/api/config/active-models");
   return handleResponse<Record<Agent, string>>(res);

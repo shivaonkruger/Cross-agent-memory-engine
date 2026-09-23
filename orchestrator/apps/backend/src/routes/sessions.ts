@@ -1,5 +1,10 @@
 import { Router } from "express";
-import { createSession, getSessionOwnerId, listActiveSessions } from "../services/sessionsService";
+import {
+  createSession,
+  deleteSession,
+  getSessionOwnerId,
+  listActiveSessions,
+} from "../services/sessionsService";
 import { getSessionMessages } from "../services/messagesService";
 
 export const sessionsRouter = Router();
@@ -39,5 +44,21 @@ sessionsRouter.get("/:sessionId/messages", async (req, res) => {
   } catch (err) {
     console.error("[routes/sessions] GET /:sessionId/messages failed", err);
     res.status(500).json({ error: "Failed to fetch session messages" });
+  }
+});
+
+sessionsRouter.delete("/:sessionId", async (req, res) => {
+  try {
+    const deleted = await deleteSession(req.params.sessionId, req.userId!);
+    // Same not-found-vs-not-yours ambiguity as the other routes above —
+    // covers "doesn't exist", "not yours", and "already deleted" alike.
+    if (!deleted) {
+      res.status(404).json({ error: "Session not found" });
+      return;
+    }
+    res.status(204).send();
+  } catch (err) {
+    console.error("[routes/sessions] DELETE /:sessionId failed", err);
+    res.status(500).json({ error: "Failed to delete session" });
   }
 });
