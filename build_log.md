@@ -378,6 +378,20 @@ and a validated event gets written to a real relational table.
   named when this was planned (a resolved event's cached copy in
   event_window can go stale), still deliberately unsolved, still
   deferred to the compression engine phase
+- (fix, 2026-09-23): the original `resolves`-linking mechanism trusted
+  the classifier's output with no validation. Hardened in
+  `eventWriter.ts`: a `resolves` target must now exist, belong to the
+  same session, be type `QUESTION`, and be currently unresolved, or the
+  pointer is stripped and logged rather than written — never allowed to
+  fail the whole event write. Verified via 5 targeted cases (hallucinated
+  id, cross-session leakage, wrong-type target, already-resolved target,
+  and a valid-resolution regression check), all confirmed via psql — full
+  detail in tests.md Test 2. That verification also corrected an
+  assumption behind the fix itself: `events.resolves` already has a real
+  FK constraint, so a hallucinated id pre-fix would have thrown and
+  rolled back the entire write (silently losing the event), not silently
+  corrupted the graph as originally assumed — only the cross-session and
+  already-resolved cases actually matched that original description
 - Resilience was extended beyond what the task doc literally asked for:
   it required classifier failures to never block the user's reply; the
   actual guard wraps classify AND write together, so an eventWriter DB
@@ -419,6 +433,17 @@ vendor/model string does hard-fail (400), which is what Test D actually
 exercised. No guardrail against the fuzzy-match case exists yet anywhere
 model strings are configured.
 
+(extended verification, 2026-09-23): a 20-turn multi-agent stress test
+exercised every event type, cross-agent behavior, resolution chaining,
+and the `event_window` eviction cap under real conversational load —
+full turn-by-turn detail in tests.md Test 1. Confirmed working: FINDING/
+DECISION/CONTRADICTION/HANDOFF all classified correctly across all three
+agents; forcing the total to 24 events confirmed `event_window` holds
+exactly the 20 most recent, oldest evicted from the cache but permanent
+in `events`; the classifier's passive-scan fallback correctly caught an
+event even when the agent's self-annotation used a malformed, non-spec
+tag format. QUESTION/BLOCKER/OUTPUT were not exercised — see Deferred.
+
 **Deferred at this stage**: the compression engine / tiering system
 (`tier`, `compressed` columns exist but nothing sets them) — this was
 and remains the next real gap, including the event/event_window drift
@@ -428,6 +453,23 @@ exercised the `claude` agent slot (`poolside/laguna-s-2.1:free`) — the
 `gpt4`/`gemini` classifier paths weren't separately tested; no guardrail
 against OpenRouter's fuzzy model-string matching silently routing a typo
 to a paid model instead of erroring.
+
+(surfaced, 2026-09-23, not yet fixed — see tests.md Test 1): a real code
+bug — `agentPipe.ts` does `completion.choices[0]` where `?.` only guards
+past the index, not the array access itself; when a provider returns a
+200 with no `choices` array at all, this throws and the whole turn is
+lost, leaving an orphaned user message with no assistant reply. Also
+discovered: OpenRouter enforces an account-wide **50-requests-per-day**
+free-tier cap, separate from and more serious than the per-model
+upstream-provider throttling already noted above — this one would
+eventually block every agent, not just one. Also surfaced: an agent's
+self-annotation tag can be malformed and still leak into user-visible
+text (the parser only strips the correctly-formatted tag); and
+`resolves` was observed being used to mean "supersedes" rather than
+strictly "answers this open question" (now moot for invalid targets
+specifically, per the hardening fix above, but the semantic looseness
+itself is unchanged). None of these four are fixed by this addendum —
+recorded here so a future phase doesn't have to rediscover them.
 
 ---
 
@@ -476,6 +518,67 @@ is logged against, not the earlier build/lint checks alone.
 raw HTML passthrough) is relied on as-is, not separately re-verified
 against adversarial input; not tested against very large tables or
 deeply nested lists.
+
+---
+
+## Phase 10 — No-emoji instruction + delete session
+
+**Goal**: two small requests bundled together — stop agents from using
+emojis in responses, and let a user delete a session they no longer
+want from the session list.
+
+**What was built**:
+- `contextInjector.ts`: added "Do not use emojis in your responses." to
+  the always-on `[YOUR ROLE]` section of the system prompt — applies
+  unconditionally on every call, for every agent, same as the rest of
+  that block (event-candidate instructions included)
+- `sessionsService.ts`: `deleteSession(sessionId, userId)` — soft-
+  deletes via the existing `sessions.deleted_at` column, scoped to the
+  owning user; returns whether a row was actually affected, so the
+  route can tell "not found" / "not yours" / "already deleted" apart
+  from a genuine failure
+- `routes/sessions.ts`: `DELETE /api/sessions/:sessionId` — same
+  404-not-403 not-found-vs-not-yours pattern already used by the other
+  routes in this router (Phase 7); 204 on success
+- `api/client.ts`: `deleteSession()` — handles the empty 204 body
+  directly instead of going through `handleResponse`'s `res.json()`
+- `SessionListItem.tsx`: restructured from a single full-card
+  `<button>` (couldn't nest a second interactive control inside it)
+  into two sibling controls — the existing click-to-open area, plus a
+  delete control. Shipped first as a text label, then swapped on
+  request for an inline trash-can SVG icon (no icon library added)
+- `SessionListPage.tsx`: wires the delete handler in with a
+  `window.confirm` guard (soft-deleted server-side, but nothing in the
+  UI surfaces an undo) and drops the deleted session from local state
+  on success
+
+**Key decisions**:
+- No new npm dependency for the icon — one inline SVG fits the
+  existing no-decoration monochrome look better than an icon library
+  pulled in for a single icon
+- Deletion is soft (`deleted_at`), not a hard DELETE — `listActiveSessions`
+  already filtered on `deleted_at IS NULL` since Phase 2, so nothing
+  changed schema-side, this just gives users a way to set it
+
+**Verified**: backend and frontend both type-check and lint clean.
+End-to-end curl pass: created a session, confirmed it listed, deleted
+it (204), confirmed it dropped out of the list, confirmed deleting it
+again 404s, confirmed deleting a random nonexistent id 404s, confirmed
+in psql that `deleted_at` was actually set (not a hard delete).
+Separately verified the ownership check with two users: user B got a
+404 attempting to delete user A's session, and it stayed live and
+listed for A afterward. Test users/sessions cleaned up after
+verification. User confirmed both the no-emoji behavior and the delete
+feature (with the icon swap) working in the actual browser before
+asking for this to be logged.
+
+**Deferred at this stage**: no delete affordance from inside
+`SessionViewPage` (chat view) itself — only from the session list page;
+no undo surfaced anywhere in the UI even though the delete is soft
+server-side, so a session is unrecoverable except via direct DB access;
+no enforcement or stripping of emojis on the response side — it's a
+prompt-level instruction only, relies on model compliance, not
+independently re-verified against every agent/model in the roster.
 
 ---
 

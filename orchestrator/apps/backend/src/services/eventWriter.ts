@@ -30,6 +30,40 @@ export async function writeEvent(
   try {
     await client.query("BEGIN");
 
+    // The classifier's `resolves` comes from an LLM and cannot be trusted
+    // as-is: it can hallucinate an id that doesn't exist, reference a real
+    // event belonging to a DIFFERENT session, point at something that isn't
+    // even a QUESTION, or re-target a QUESTION that's already resolved.
+    // Whether this response's reasoning actually answers that question is
+    // unavoidably the model's judgment call — but whether the target is
+    // real, ours, the right type, and still open is pure state safety, and
+    // gets enforced here before anything touches the database. An invalid
+    // reference is stripped and logged, never allowed to corrupt the graph
+    // and never allowed to fail the write.
+    let validatedResolves: string | null = null;
+    if (event.resolves) {
+      const targetCheck = await client.query(
+        `SELECT id FROM events
+         WHERE id = $1
+           AND session_id = $2
+           AND type = 'QUESTION'
+           AND resolved_by IS NULL
+           AND deleted_at IS NULL`,
+        [event.resolves, sessionId]
+      );
+
+      if (targetCheck.rows.length === 0) {
+        console.warn(
+          `eventWriter: invalid resolves reference "${event.resolves}" for session ${sessionId} — ` +
+            `target does not exist, belongs to another session, is not an open QUESTION, or was ` +
+            `already resolved. Stripping the pointer; new event will be written without a resolves link.`
+        );
+        validatedResolves = null;
+      } else {
+        validatedResolves = event.resolves;
+      }
+    }
+
     await client.query(
       `INSERT INTO events (id, session_id, type, agent, summary, confidence, resolves, requires_response, payload)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '{}'::jsonb)`,
@@ -40,13 +74,13 @@ export async function writeEvent(
         agent,
         event.summary,
         event.confidence || null,
-        event.resolves,
+        validatedResolves,
         requiresResponse,
       ]
     );
 
-    if (event.resolves) {
-      await client.query("UPDATE events SET resolved_by = $1 WHERE id = $2", [eventId, event.resolves]);
+    if (validatedResolves) {
+      await client.query("UPDATE events SET resolved_by = $1 WHERE id = $2", [eventId, validatedResolves]);
     }
 
     const shortTermResult = await client.query<ShortTermMemoryRow>(
@@ -77,8 +111,8 @@ export async function writeEvent(
     if (requiresResponse) {
       pendingQuestions = [...pendingQuestions, eventId];
     }
-    if (event.resolves) {
-      pendingQuestions = pendingQuestions.filter((id) => id !== event.resolves);
+    if (validatedResolves) {
+      pendingQuestions = pendingQuestions.filter((id) => id !== validatedResolves);
     }
 
     await client.query(
@@ -89,8 +123,13 @@ export async function writeEvent(
     );
 
     await client.query("COMMIT");
+    const resolvesLogValue = validatedResolves
+      ? validatedResolves
+      : event.resolves
+        ? "none (stripped invalid reference)"
+        : "none";
     console.log(
-      `eventWriter: wrote ${eventId}, type=${event.type}, session=${sessionId}, agent=${agent}, resolves=${event.resolves ?? "none"}`
+      `eventWriter: wrote ${eventId}, type=${event.type}, session=${sessionId}, agent=${agent}, resolves=${resolvesLogValue}`
     );
     return { eventId };
   } catch (err) {
