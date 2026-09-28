@@ -250,6 +250,12 @@ slot) returned `429 Provider returned error` on two attempts — read as
 the free provider being transiently overloaded, not removed like
 gpt-oss was, so left as-is pending further evidence.
 
+(fix, 2026-09-28): the evidence arrived — `google/gemma-4-26b-a4b-it:free`
+failed on every single turn (6/6) during Phase 8's 20-turn stress test
+(tests.md Test 1), not transient overload. Swapped the `gpt4` slot to
+`poolside/laguna-s-2.1:free`, the same slug already verified working for
+`claude`/`SUMMARIZER_MODEL`/`CLASSIFIER_MODEL`.
+
 ---
 
 ## Phase 7 — JWT authentication + per-user session authorization
@@ -392,6 +398,21 @@ and a validated event gets written to a real relational table.
   rolled back the entire write (silently losing the event), not silently
   corrupted the graph as originally assumed — only the cross-session and
   already-resolved cases actually matched that original description
+- (fix, 2026-09-28): `events.payload` was hardcoded to `'{}'::jsonb`
+  literally, regardless of event type — a read-only audit performed
+  first (as requested) found this wasn't actually discarding any real
+  data: `EventCandidate` has exactly four fields (`type`, `summary`,
+  `confidence`, `resolves`), and all four already have their own
+  dedicated columns. There was never any type-specific data (OUTPUT's
+  code, HANDOFF's target agent) produced anywhere upstream to lose in
+  the first place — this was a deliberate Phase 8 deferral, not an
+  oversight. Fixed anyway, on request: `payload` is now built as
+  `{ summary, confidence }` and passed as a real parameterized JSONB
+  value, so the INSERT is genuinely dynamic and future per-type fields
+  slot in without touching the query again — honestly a duplication of
+  already-stored columns for now, not new information recovered.
+  Verified via tests.md Test 3 (two different event types, both showed
+  distinct non-empty payloads matching their own data)
 - Resilience was extended beyond what the task doc literally asked for:
   it required classifier failures to never block the user's reply; the
   actual guard wraps classify AND write together, so an eventWriter DB
@@ -579,6 +600,90 @@ server-side, so a session is unrecoverable except via direct DB access;
 no enforcement or stripping of emojis on the response side — it's a
 prompt-level instruction only, relies on model compliance, not
 independently re-verified against every agent/model in the roster.
+
+---
+
+## Phase 11 — Event corroboration (pgvector embeddings)
+
+(The task doc for this didn't number itself, but it's clearly new
+functionality — not a fix to Phase 8's eventWriter.ts, even though it
+touches the same file — so it gets its own phase, not a Phase 8
+addendum, per this log's own new-capability-vs-fix rule.)
+
+**Goal**: link events from different agents in the same session that
+independently say the same thing — corroboration/consensus tracking,
+via sentence-embedding similarity. Fully additive to and orthogonal
+from Phase 8's `resolves`/`resolved_by` (question-answering) mechanism.
+
+**What was built**:
+- Postgres image swapped to `pgvector/pgvector:pg16` in
+  docker-compose.yml — the running `postgres:16` had no vector
+  extension available at all (`CREATE EXTENSION vector` failed outright)
+- Migration `009_add_corroboration.sql`: `events.embedding vector(384)`,
+  `events.corroborated_by TEXT[] DEFAULT '{}'`, `events.corroboration_count
+  INTEGER DEFAULT 0`, HNSW index on `embedding` (`vector_cosine_ops`)
+- `lib/embeddings.ts`: `getEmbedding(text)` using
+  `@huggingface/transformers`'s `Xenova/all-MiniLM-L6-v2` (384-dim),
+  model loaded once on first use and reused across every call;
+  `toVectorLiteral()` for parameterized pgvector inserts
+- `eventWriter.ts`: on every `writeEvent` call, for every event type (no
+  filtering) — embeds the new event's summary, queries same-session/
+  different-agent candidates via the `<=>` cosine-distance operator,
+  links every candidate above `CORROBORATION_THRESHOLD` in both
+  directions (new event's `corroborated_by`/count, and each matched
+  existing event's `corroborated_by`/count updated in place), all inside
+  the existing single transaction
+- A clearly-marked TEMP logging block: logs every similarity score
+  actually computed (not just the ones that matched), with both event
+  ids and summaries, for later threshold tuning
+
+**Key decisions**:
+- `@xenova/transformers` (the spec's named library) could not be
+  installed on this machine — it pulls in `sharp`, whose prebuilt
+  binary download timed out and whose source-build fallback needs a
+  Visual Studio C++ toolchain that isn't present here (confirmed on a
+  retry, not transient). Swapped to `@huggingface/transformers`, the
+  actively-maintained successor — installs cleanly, loads the same model
+- HNSW chosen over IVFFlat for the vector index: IVFFlat's `lists`
+  parameter needs a meaningful row count to tune against, and this
+  table is still small — HNSW has no equivalent cold-start problem
+- `CORROBORATION_THRESHOLD = 0.85` is an explicit placeholder, not a
+  tuned value — the TEMP logging block exists specifically to gather
+  real scores before it's ever adjusted; it was NOT nudged to make any
+  test pass
+- Same-agent matches are excluded at the SQL level (`agent != $3`), not
+  merely by low similarity — structurally impossible for an agent to
+  corroborate itself
+- Cross-session matching is deliberately excluded — the candidate query
+  is scoped to `session_id = $2`
+- No existing columns, logic, schema, classifier, or Phase 8
+  novelty-checking touched — this coexists alongside them, doesn't
+  replace or interact with any of it
+
+**Verified**: pgvector confirmed active (extension 0.8.6) after the
+image swap; all pre-existing sessions/tables confirmed to survive the
+swap intact. Embedding generation smoke-tested independently (a real
+384-dim vector produced) before any feature code was written around it.
+Migration applied; schema confirmed via `\d events` to match spec
+exactly. Ran the three required test cases against a fresh session
+(temporary script, deleted after use — tests.md Test 4): same-agent
+identical summaries correctly NOT linked (structural, not
+threshold-dependent); unrelated summaries correctly NOT linked
+(similarities near zero/negative); different-agent near-identical
+summaries (the spec's own example pair) measured at **0.8311**
+similarity — NOT linked, since that's below the 0.85 placeholder. This
+is the first real tuning data point, not a bug — reported plainly
+rather than adjusting the threshold to force the demo to pass.
+
+**Deferred at this stage**: `CORROBORATION_THRESHOLD` remains untuned —
+needs review against accumulated real scores from the TEMP logging
+block, which itself needs deleting once tuning is done; no UI/API
+surface for displaying corroboration data (explicitly out of scope);
+no interaction between this and the classifier's separate "novelty
+check" (Phase 8) — the two mechanisms currently coexist without
+referencing each other; the collation-version-mismatch warning
+surfaced by the Postgres image swap (glibc version difference between
+the old and new images) is cosmetic so far but unaddressed.
 
 ---
 

@@ -2,6 +2,7 @@ export type Agent = "claude" | "gpt4" | "gemini";
 
 export interface Session {
   sessionId: string;
+  name: string;
   createdAt: string;
 }
 

@@ -65,8 +65,21 @@ export async function getCurrentUser(): Promise<User> {
   return handleResponse<User>(res);
 }
 
-export async function createSession(): Promise<Session> {
-  const res = await authedFetch("/api/sessions", { method: "POST" });
+export async function createSession(name: string): Promise<Session> {
+  const res = await authedFetch("/api/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  return handleResponse<Session>(res);
+}
+
+export async function renameSession(sessionId: string, name: string): Promise<Session> {
+  const res = await authedFetch(`/api/sessions/${sessionId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
   return handleResponse<Session>(res);
 }
 

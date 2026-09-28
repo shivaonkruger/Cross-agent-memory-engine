@@ -202,3 +202,210 @@ explicitly out of scope for this fix.
 **Logging note**: per the task's own instructions, this is a correction
 to Phase 8, not a new capability. Pending the user's confirmation, it
 becomes a dated addendum inside Phase 8's entry.
+
+---
+
+## Test 4 — Corroboration feature: environment blockers + 3-case verification (2026-09-28)
+
+**What was tested**: a new event-corroboration feature (pgvector
+embeddings + cross-agent similarity matching) — genuinely new
+functionality, not a fix to something already built. This is NOT logged
+to build_log.md yet; the user asked to batch this with other pending
+fixes into one Phase 8 update later, on request.
+
+**Why**: to link events from different agents in the same session that
+say the same thing, tracked via `corroborated_by`/`corroboration_count`
+on the `events` table, using sentence-embedding cosine similarity.
+
+**How**: two hard environment assumptions were verified before writing
+any code (both failed on the first attempt, both fixed):
+- **pgvector**: the running Postgres was vanilla `postgres:16` —
+  `CREATE EXTENSION vector` failed outright. `docker-compose.yml` was
+  already pointed at `pgvector/pgvector:pg16` (pre-edited, not yet
+  applied) — recreating the container picked it up. Verified: extension
+  0.8.6 active, and all 8 pre-existing sessions/tables survived the
+  image swap intact (same underlying data directory/volume, compatible
+  Postgres major version).
+- **@xenova/transformers** (the spec's named library): failed to install
+  — pulls in `sharp`, whose prebuilt binary download timed out and whose
+  source-build fallback needs a Visual Studio C++ toolchain not present
+  on this machine. Confirmed on a retry, not transient. Swapped to
+  `@huggingface/transformers` (the actively-maintained successor) on the
+  user's direction — installed cleanly, no native build step. Verified
+  with a real smoke test: loaded `Xenova/all-MiniLM-L6-v2` and generated
+  an actual 384-dimensional embedding before writing the real feature
+  code around it.
+
+Built: migration `009_add_corroboration.sql` (`embedding vector(384)`,
+`corroborated_by TEXT[] DEFAULT '{}'`, `corroboration_count INTEGER
+DEFAULT 0`, HNSW index — chosen over IVFFlat since IVFFlat needs a
+meaningful row count to tune `lists` against and this table is still
+small); `lib/embeddings.ts` (`getEmbedding`, model loaded once and
+reused); matching logic added to `eventWriter.ts` (embed the new
+event's summary, query same-session/different-agent candidates via
+`<=>` cosine distance, log every computed score under a clearly marked
+TEMP block, link everything above `CORROBORATION_THRESHOLD = 0.85`).
+Diff shown to the user before finalizing, as requested.
+
+Then created a fresh session and ran the three required cases directly
+against `eventWriter.writeEvent` (bypassing the classifier) via a
+temporary script, deleted after use along with the test session.
+
+**Results**:
+- Case 2 (same agent, identical summaries): correctly **not** linked —
+  and structurally guaranteed, not threshold-dependent: the SQL's
+  `agent != $3` filter excludes same-agent rows from the candidate set
+  entirely.
+- Case 3 (different agents, unrelated summaries): correctly **not**
+  linked — similarities near zero or negative (-0.07 to 0.03).
+- Case 1 (different agents, near-identical summaries — the spec's own
+  example pair: "The bug is in the auth module" / "Looks like the issue
+  is in the authentication module"): **not** linked. Real measured
+  similarity was **0.8311**, below the placeholder `0.85` threshold.
+
+**This is not a bug** — it's the first real tuning data point the TEMP
+logging exists to produce, and it says the placeholder threshold is
+probably a little high for genuine paraphrases. The threshold was left
+at `0.85` exactly as specified rather than adjusted to make the demo
+pass, per the spec's own instruction not to hardcode a "final" value.
+Flagged plainly to the user rather than silently tuned.
+
+**Logging note**: this is new functionality (Phase 8 already covers the
+events table/classifier/eventWriter it extends), but the user explicitly
+asked to hold off on any build_log.md entry until they give the word to
+batch it with other pending fixes.
+
+---
+
+## Test 5 — Stop-response feature: real client abort mid-request (2026-09-28)
+
+**What was tested**: the new "stop response" feature — `AgentPanel.tsx`
+(Stop button + `AbortController`), `api/client.ts` (forwards the
+signal), `routes/agents.ts` (`req.on("close")` → aborts a per-request
+`AbortController`), and `agentPipe.ts` (passes the signal into the
+OpenRouter call, checks `signal.aborted` both on throw and on the
+post-completion race, never writes the assistant message or runs the
+classifier/eventWriter when aborted).
+
+**Why**: before this, once a message was sent there was no way to cancel
+it — the request always ran to completion, cost the full OpenRouter
+call, and always got written to `messages`/`events`. Also surfaced and
+resolved a scope question first: the app doesn't actually do token-level
+streaming today (`chat.completions.create` is a single blocking call,
+no `stream: true`, no SSE) — the pasted spec's "while it's streaming"
+framing doesn't literally apply. User chose to scope this as
+cancel-the-in-flight-request rather than also building real token
+streaming first.
+
+**How**: found and killed a stale leftover backend process from earlier
+in this session that was still bound to port 3000 serving old
+pre-fix code (a real process-management bug worth noting for future
+sessions: backgrounding `npm run dev` with plain shell `&` inside a
+Bash tool call does not reliably survive the tool call ending — it
+either got orphaned or silently exited; using the tool's dedicated
+`run_in_background` mechanism instead kept it alive correctly). Started
+a clean backend instance, created a disposable test user
+(`stoptest@example.com`) and session (`e1acbade-e50e-4108-b8e9-
+7769cd5456d7`), then sent a real `POST /api/agents/message` request via
+curl with `--max-time 1` against a prompt long enough that the model
+call would still be in flight at the 1-second mark — forcing curl to
+drop the connection client-side, the same effect a browser's
+`AbortController.abort()` has on the underlying fetch. Checked the
+backend's live console output and queried `messages`/`events` via psql
+afterward. Test session soft-deleted via `DELETE /api/sessions/:id`
+afterward (the delete-session feature itself, exercised incidentally).
+
+**Results**: curl exited with code 28 (client-side timeout), confirming
+a real dropped connection, not a simulated one. Backend log showed the
+full intended sequence with no crash — `step=insert_user_message` had
+already run, then `step=call_openrouter` started, then
+`step=aborted_by_client — response discarded, not written` fired
+immediately on the `req.on("close")` → `controller.abort()` →
+OpenRouter call rejection chain, then the route handler logged the
+abort and returned cleanly (no 500, no unhandled rejection). psql
+confirmed: the user's message was saved (`role=user`, correct content,
+correct timestamp) exactly as intended — "the user's own prompt stays
+saved, only the incomplete AI response is thrown away" — while `events`
+had zero rows for the session and no assistant-role row was ever
+written to `messages`. Ran the same abort twice (once accidentally
+against the stale process before it was killed, once against the fixed
+one); both left the same clean state, so the result isn't a fluke of
+one particular timing.
+
+**Not exercised by this test**: the actual React UI (button swapping to
+"Stop", the click handler, the `AbortError` branch in `AgentPanel.tsx`'s
+catch block) — this test verified the backend half of the contract
+(client disconnect → server stops calling the LLM → nothing partial
+gets written) against a real dropped connection, not a browser click.
+The frontend half is small and mirrors patterns already manually
+verified elsewhere in this project (e.g. the delete-session confirm
+dialog), but wasn't independently clicked through in a browser this
+time.
+
+**Logging note**: this is a new capability (Phase 8 didn't have any
+notion of cancellation), not a fix to something already logged. Pending
+the user's confirmation, per convention it would get its own
+build_log.md phase rather than being folded into an existing one.
+
+---
+
+## Test 6 — Named sessions: create-with-name, rename, validation (2026-09-28)
+
+**What was tested**: the new `sessions.name` column, `createSession`
+now requiring a name, the new `renameSession`/`PATCH /:sessionId`
+endpoint, and the create/rename empty-name validation.
+
+**Why**: sessions previously had no name at all (list UI only ever
+showed the raw UUID and a timestamp) — this adds a real, editable label
+at creation time and afterward.
+
+**How**: applied migration `010_add_session_name.sql`
+(`ALTER TABLE sessions ADD COLUMN name TEXT NOT NULL DEFAULT 'New
+session'`) via `npm run migrate` against the real dev database, then
+exercised every path directly with curl against the live backend
+(same instance already running from the stop-response test, hot-reloaded
+by nodemon on the code changes): create with an explicit name, list
+(confirms persistence), rename, rename with a whitespace-only name,
+create with an empty-string name, create with the `name` field omitted
+entirely, and rename of a nonexistent/not-owned session id. Both test
+sessions soft-deleted afterward.
+
+**Results**: all 7 cases behaved exactly as implemented —
+- Create with `{"name":"Stress test planning"}` → `201` with that exact
+  name in the response.
+- `GET /api/sessions` → the same name comes back in the list.
+- `PATCH .../:id` with `{"name":"Renamed session"}` → `200`, name
+  updated.
+- `PATCH` with `{"name":"   "}` (whitespace-only) → `400 "name is
+  required"`, nothing written.
+- `POST /` with `{"name":""}` → `400 "name must be a non-empty
+  string"`.
+- `POST /` with `{}` (no `name` key at all) → `201`, server-side default
+  `"New session"` applied — this path exists for API robustness; the
+  actual frontend modal always sends an explicit name.
+- `PATCH` on a random nonexistent UUID → `404 "Session not found"` (same
+  ownership-ambiguity pattern as delete/list — doesn't distinguish
+  "doesn't exist" from "not yours").
+
+**Validation choice** (spec offered two options — block, or fall back to
+the previous name — and asked to pick one and note it): chose **block**
+on the backend (empty/whitespace name → `400`, no write happens) and
+**fall back to the previous name** on the frontend's inline rename UI
+specifically (`SessionListItem.tsx`'s `commitRename`: an empty or
+unchanged trimmed value is a silent no-op, reverting the input back to
+`session.name` with no request sent at all). The creation modal's
+Create button is simply disabled on an empty/whitespace name, so that
+path can't submit empty in the first place. Three different UI-layer
+answers to the same rule (backend rejects outright; the modal disables
+its button; the inline rename silently reverts) rather than one
+mechanism, because each is the natural fit for its own interaction
+shape — reported plainly since it's a design choice, not a spec
+requirement.
+
+**Not exercised by this test**: the actual React UI — the modal's
+Enter/Escape handling, the inline rename's double-click/edit-icon
+trigger, Enter/Escape/blur handling, and the commit-once `settledRef`
+guard against a double-fire between Enter and the blur it triggers.
+Verified by code reading and the same pattern already used successfully
+elsewhere in this project (`ConfirmDialog.tsx`'s Escape handling), but
+not independently clicked through in a browser this session.

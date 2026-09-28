@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { createSession, deleteSession, listSessions } from "../api/client";
+import { createSession, deleteSession, listSessions, renameSession } from "../api/client";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { NewSessionModal } from "../components/NewSessionModal";
 import { SessionListItem } from "../components/SessionListItem";
 import { useAuth } from "../context/AuthContext";
 import type { Session } from "../types/shared";
@@ -11,6 +12,7 @@ export function SessionListPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
+  const [showNewSessionModal, setShowNewSessionModal] = useState(false);
   const navigate = useNavigate();
   const { user, signOut } = useAuth();
 
@@ -21,9 +23,14 @@ export function SessionListPage() {
       .finally(() => setLoading(false));
   }, []);
 
-  async function handleNewSession() {
+  function handleNewSession() {
+    setShowNewSessionModal(true);
+  }
+
+  async function handleConfirmNewSession(name: string) {
+    setShowNewSessionModal(false);
     try {
-      const session = await createSession();
+      const session = await createSession(name);
       navigate(`/session/${session.sessionId}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create session");
@@ -46,6 +53,15 @@ export function SessionListPage() {
       setSessions((prev) => prev.filter((s) => s.sessionId !== sessionId));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to delete session");
+    }
+  }
+
+  async function handleRename(sessionId: string, name: string) {
+    try {
+      const updated = await renameSession(sessionId, name);
+      setSessions((prev) => prev.map((s) => (s.sessionId === sessionId ? updated : s)));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to rename session");
     }
   }
 
@@ -82,6 +98,7 @@ export function SessionListPage() {
               key={session.sessionId}
               session={session}
               onDelete={handleRequestDelete}
+              onRename={handleRename}
             />
           ))}
         </div>
@@ -94,6 +111,13 @@ export function SessionListPage() {
           confirmLabel="Delete"
           onConfirm={handleConfirmDelete}
           onCancel={() => setPendingDeleteId(null)}
+        />
+      )}
+
+      {showNewSessionModal && (
+        <NewSessionModal
+          onConfirm={handleConfirmNewSession}
+          onCancel={() => setShowNewSessionModal(false)}
         />
       )}
     </div>

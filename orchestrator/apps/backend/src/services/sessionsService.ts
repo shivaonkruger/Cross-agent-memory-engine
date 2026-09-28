@@ -3,14 +3,14 @@ import type { Agent, Session } from "../types/shared";
 
 const ALL_AGENTS: Agent[] = ["claude", "gpt4", "gemini"];
 
-export async function createSession(userId: string): Promise<Session> {
+export async function createSession(userId: string, name: string): Promise<Session> {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
-    const result = await client.query<{ id: string; created_at: Date }>(
-      "INSERT INTO sessions (user_id) VALUES ($1) RETURNING id, created_at",
-      [userId]
+    const result = await client.query<{ id: string; created_at: Date; name: string }>(
+      "INSERT INTO sessions (user_id, name) VALUES ($1, $2) RETURNING id, created_at, name",
+      [userId, name]
     );
     const row = result.rows[0]!;
 
@@ -24,7 +24,7 @@ export async function createSession(userId: string): Promise<Session> {
     }
 
     await client.query("COMMIT");
-    return { sessionId: row.id, createdAt: row.created_at.toISOString() };
+    return { sessionId: row.id, createdAt: row.created_at.toISOString(), name: row.name };
   } catch (err) {
     await client.query("ROLLBACK");
     throw err;
@@ -34,14 +34,37 @@ export async function createSession(userId: string): Promise<Session> {
 }
 
 export async function listActiveSessions(userId: string): Promise<Session[]> {
-  const result = await pool.query<{ id: string; created_at: Date }>(
-    "SELECT id, created_at FROM sessions WHERE user_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC",
+  const result = await pool.query<{ id: string; created_at: Date; name: string }>(
+    "SELECT id, created_at, name FROM sessions WHERE user_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC",
     [userId]
   );
   return result.rows.map((row) => ({
     sessionId: row.id,
     createdAt: row.created_at.toISOString(),
+    name: row.name,
   }));
+}
+
+/**
+ * Renames a session — only if it exists, isn't deleted, and is owned by
+ * userId (same ownership guard as deleteSession). Returns the updated
+ * session, or null if not found/not yours, so the route can 404 rather
+ * than leak whether a session id belongs to someone else.
+ */
+export async function renameSession(
+  sessionId: string,
+  userId: string,
+  name: string
+): Promise<Session | null> {
+  const result = await pool.query<{ id: string; created_at: Date; name: string }>(
+    "UPDATE sessions SET name = $1 WHERE id = $2 AND user_id = $3 AND deleted_at IS NULL RETURNING id, created_at, name",
+    [name, sessionId, userId]
+  );
+  const row = result.rows[0];
+  if (!row) {
+    return null;
+  }
+  return { sessionId: row.id, createdAt: row.created_at.toISOString(), name: row.name };
 }
 
 /** Returns the owning user's id, or null if the session doesn't exist (or was deleted). */
