@@ -1,8 +1,20 @@
 import { nanoid } from "nanoid";
 import { pool } from "../db/pool";
+import { getEmbedding, toVectorLiteral } from "../lib/embeddings";
 import type { EventCandidate } from "./responseParser";
 
 const EVENT_WINDOW_CAP = 20;
+
+// Starting guess, NOT a tuned value — pending review of real similarity
+// scores logged below (see the TEMP threshold-tuning block in writeEvent).
+const CORROBORATION_THRESHOLD = 0.85;
+
+interface CorroborationCandidate {
+  id: string;
+  agent: string;
+  summary: string;
+  similarity: number;
+}
 
 interface ShortTermMemoryRow {
   event_window: Array<Record<string, unknown>>;
@@ -74,9 +86,45 @@ export async function writeEvent(
     // NOT yet capturing anything not already stored elsewhere in the row.
     const payload = { summary: event.summary, confidence: event.confidence || null };
 
+    // Corroboration: does this event match something a DIFFERENT agent
+    // already said in this session? Applies to every event type, no
+    // filtering — the spec explicitly asked for that. Cross-session
+    // matching and same-agent matching are both deliberately excluded (an
+    // agent shouldn't be able to "corroborate" itself).
+    const embedding = await getEmbedding(event.summary);
+    const vectorLiteral = toVectorLiteral(embedding);
+
+    const candidatesResult = await client.query<CorroborationCandidate>(
+      `SELECT id, agent, summary, 1 - (embedding <=> $1::vector) AS similarity
+       FROM events
+       WHERE session_id = $2
+         AND agent != $3
+         AND embedding IS NOT NULL
+         AND deleted_at IS NULL
+       ORDER BY embedding <=> $1::vector`,
+      [vectorLiteral, sessionId, agent]
+    );
+
+    const matchedIds: string[] = [];
+    for (const candidate of candidatesResult.rows) {
+      // TEMP: threshold tuning, remove after tuning is done. Logs every
+      // similarity score this call actually computed (not just the ones
+      // that cleared the threshold) so real data can inform where
+      // CORROBORATION_THRESHOLD should actually land.
+      console.log(
+        `corroboration-tuning: new="${event.summary}" (agent=${agent}) vs ` +
+          `existing="${candidate.summary}" (id=${candidate.id}, agent=${candidate.agent}) ` +
+          `similarity=${candidate.similarity.toFixed(4)}`
+      );
+
+      if (candidate.similarity > CORROBORATION_THRESHOLD) {
+        matchedIds.push(candidate.id);
+      }
+    }
+
     await client.query(
-      `INSERT INTO events (id, session_id, type, agent, summary, confidence, resolves, requires_response, payload)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      `INSERT INTO events (id, session_id, type, agent, summary, confidence, resolves, requires_response, payload, embedding, corroborated_by, corroboration_count)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::vector, $11, $12)`,
       [
         eventId,
         sessionId,
@@ -87,11 +135,24 @@ export async function writeEvent(
         validatedResolves,
         requiresResponse,
         JSON.stringify(payload),
+        vectorLiteral,
+        matchedIds,
+        matchedIds.length,
       ]
     );
 
     if (validatedResolves) {
       await client.query("UPDATE events SET resolved_by = $1 WHERE id = $2", [eventId, validatedResolves]);
+    }
+
+    for (const matchedId of matchedIds) {
+      await client.query(
+        `UPDATE events
+         SET corroborated_by = array_append(corroborated_by, $1),
+             corroboration_count = corroboration_count + 1
+         WHERE id = $2`,
+        [eventId, matchedId]
+      );
     }
 
     const shortTermResult = await client.query<ShortTermMemoryRow>(
