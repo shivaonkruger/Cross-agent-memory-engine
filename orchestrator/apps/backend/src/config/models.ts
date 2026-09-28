@@ -19,9 +19,15 @@ const PAID_MODELS: Record<Agent, string> = {
 // openai/gpt-oss-20b:free was pulled from OpenRouter's free tier (now 404s
 // with "unavailable for free") and replaced with poolside/laguna-s-2.1:free,
 // confirmed working via a live test call on 2026-09-13.
+//
+// google/gemma-4-26b-a4b-it:free (previously the gpt4 slot) failed on every
+// single turn (6/6) during the 20-turn stress test — upstream provider
+// (Google AI Studio) rate-limited its shared free pool every time, not a
+// one-off. Swapped to poolside/laguna-s-2.1:free (2026-09-28), the same
+// slug already verified working for claude/summarizer/classifier.
 const FREE_MODELS: Record<Agent, string> = {
   claude: "poolside/laguna-s-2.1:free",
-  gpt4: "google/gemma-4-26b-a4b-it:free",
+  gpt4: "poolside/laguna-s-2.1:free",
   gemini: "nvidia/nemotron-3-ultra-550b-a55b:free",
 };
 
