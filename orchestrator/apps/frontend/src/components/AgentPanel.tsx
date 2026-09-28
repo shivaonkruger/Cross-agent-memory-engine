@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { sendAgentMessage } from "../api/client";
 import { MessageBubble } from "./MessageBubble";
 import type { Agent, ChatMessage } from "../types/shared";
@@ -21,6 +21,7 @@ export function AgentPanel({ agent, sessionId, initialMessages, activeModel }: A
   const [input, setInput] = useState("");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   async function handleSend() {
     const content = input.trim();
@@ -36,13 +37,16 @@ export function AgentPanel({ agent, sessionId, initialMessages, activeModel }: A
       createdAt: new Date().toISOString(),
     };
 
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     setMessages((prev) => [...prev, optimisticMessage]);
     setInput("");
     setPending(true);
     setError(null);
 
     try {
-      const { responseText } = await sendAgentMessage({ sessionId, agent, message: content });
+      const { responseText } = await sendAgentMessage({ sessionId, agent, message: content }, controller.signal);
       setMessages((prev) => [
         ...prev,
         {
@@ -54,10 +58,20 @@ export function AgentPanel({ agent, sessionId, initialMessages, activeModel }: A
         },
       ]);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Something went wrong");
+      // A user-initiated stop rejects the fetch with AbortError — handleStop
+      // already reset the UI, so this isn't a real error to surface.
+      if (!(err instanceof DOMException && err.name === "AbortError")) {
+        setError(err instanceof Error ? err.message : "Something went wrong");
+      }
     } finally {
       setPending(false);
+      abortControllerRef.current = null;
     }
+  }
+
+  function handleStop() {
+    abortControllerRef.current?.abort();
+    setPending(false);
   }
 
   return (
@@ -95,10 +109,10 @@ export function AgentPanel({ agent, sessionId, initialMessages, activeModel }: A
         <button
           type="button"
           className="bg-primary text-surface rounded-sm px-3 py-1 text-sm disabled:opacity-50"
-          onClick={handleSend}
-          disabled={pending || !input.trim()}
+          onClick={pending ? handleStop : handleSend}
+          disabled={!pending && !input.trim()}
         >
-          Send
+          {pending ? "Stop" : "Send"}
         </button>
       </div>
     </div>

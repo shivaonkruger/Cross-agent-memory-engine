@@ -12,13 +12,11 @@ import type { Agent } from "../types/shared";
 export async function sendAgentMessage(
   sessionId: string,
   agent: Agent,
-  message: string
+  message: string,
+  signal?: AbortSignal
 ): Promise<{ responseText: string }> {
   try {
-    // Fetched BEFORE inserting this turn's user message, so the recency
-    // window/summary reflect prior turns only — the current message is
-    // appended once, explicitly, below. (Fetching after the insert would
-    // double it up, since it would already be in the "uncovered" set.)
+
     console.log(`[agentPipe] session=${sessionId} agent=${agent} step=fetch_conversation_context`);
     const { summary, recentMessages } = await getAgentConversationContext(sessionId, agent);
 
@@ -49,13 +47,25 @@ export async function sendAgentMessage(
     console.log(`[agentPipe] session=${sessionId} agent=${agent} step=call_openrouter model=${MODELS[agent]}`);
     const completion = await withRetry(
       () =>
-        getOpenrouterClient().chat.completions.create({
-          model: MODELS[agent],
-          messages: openrouterMessages,
-          max_tokens: 2048,
-        }),
-      { retries: 2, delayMs: 1000, shouldRetry: isRetryableOpenRouterError }
+        getOpenrouterClient().chat.completions.create(
+          {
+            model: MODELS[agent],
+            messages: openrouterMessages,
+            max_tokens: 2048,
+          },
+          { signal }
+        ),
+      // Never retry after the client walked away — retrying would just keep
+      // paying for generations nobody will read.
+      { retries: 2, delayMs: 1000, shouldRetry: (err) => !signal?.aborted && isRetryableOpenRouterError(err) }
     );
+
+    if (signal?.aborted) {
+      // Rare race: the OpenRouter call finished right as the client
+      // disconnected/hit stop. Treat it exactly like a mid-call abort — the
+      // response is discarded below, nothing gets written for it.
+      throw new DOMException("Aborted by client", "AbortError");
+    }
 
     const rawResponseText = completion.choices[0]?.message?.content ?? "";
     console.log(`[agentPipe] session=${sessionId} agent=${agent} step=call_openrouter done`);
@@ -99,7 +109,11 @@ export async function sendAgentMessage(
 
     return { responseText: cleanText };
   } catch (err) {
-    console.error(`[agentPipe] session=${sessionId} agent=${agent} step=failed`, err);
+    if (signal?.aborted) {
+      console.log(`[agentPipe] session=${sessionId} agent=${agent} step=aborted_by_client — response discarded, not written`);
+    } else {
+      console.error(`[agentPipe] session=${sessionId} agent=${agent} step=failed`, err);
+    }
     throw err;
   }
 }

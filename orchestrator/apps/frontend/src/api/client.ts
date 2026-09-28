@@ -96,12 +96,14 @@ export async function getActiveModels(): Promise<Record<Agent, string>> {
 }
 
 export async function sendAgentMessage(
-  req: SendMessageRequest
+  req: SendMessageRequest,
+  signal?: AbortSignal
 ): Promise<SendMessageResponse> {
   const res = await authedFetch("/api/agents/message", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(req),
+    signal,
   });
   return handleResponse<SendMessageResponse>(res);
 }
