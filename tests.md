@@ -409,3 +409,116 @@ guard against a double-fire between Enter and the blur it triggers.
 Verified by code reading and the same pattern already used successfully
 elsewhere in this project (`ConfirmDialog.tsx`'s Escape handling), but
 not independently clicked through in a browser this session.
+
+---
+
+## Test 7 — Prompt box auto-grow + Shift+Enter (2026-09-28)
+
+**What was tested**: `AgentPanel.tsx`'s message input switched from
+`<input>` to an auto-growing `<textarea>` (caps at 200px / ~8-10 lines,
+then scrolls internally), plus Enter-sends / Shift+Enter-inserts-newline
+keydown handling.
+
+**Why**: requested as a pure frontend UX fix — no backend involvement.
+
+**How**: this environment has no browser-automation tool available (no
+Playwright/Puppeteer-style tool was found via a capability search), so
+this could not be click-tested in an actual running browser the way the
+system's own UI-testing expectation calls for. What *was* done: `npx
+tsc --noEmit` (clean) and a full production build (`npm run build`,
+clean — 284 modules transformed, no errors) to catch any compile-time
+or bundling problems. The resize logic itself (`useLayoutEffect` keyed
+on `input`, collapse-to-auto-then-measure-`scrollHeight`-then-clamp)
+was verified by re-reading it against the standard auto-grow-textarea
+technique, not by watching it run.
+
+**Results**: typecheck and production build both clean. **The actual
+in-browser behavior — does it grow smoothly, does it shrink back down
+on delete, does it avoid a page-jump, does Shift+Enter really insert a
+newline instead of sending — was not verified this session.** Flagging
+this plainly rather than claiming a UI test that didn't happen: this
+is a real gap, not just a formality, given three of the four
+requirements in the spec (no page-jump, shrink-on-delete, reset-after-
+send) are specifically about runtime visual behavior a type/build check
+cannot catch.
+
+---
+
+## Test 8 — Per-type event schema validation (2026-09-28)
+
+**What was tested**: a new second validation layer in `eventWriter.ts`
+— CONTRADICTION requires `claim_a`/`claim_b` (both must reference real,
+existing events in the same session), BLOCKER requires
+`what_is_blocked`/`what_resolves_it`, all other types have no extra
+requirements. Rejected events are dropped (not inserted) and logged
+with reason `schema_validation_failed`.
+
+**Why**: requested as new validation logic layered on top of the
+existing type/summary check, explicitly not touching corroboration or
+the already-fixed payload-writing mechanism.
+
+**A scope conflict surfaced before writing any code**: `EventCandidate`
+only ever had 4 fields (`type`, `summary`, `confidence`, `resolves`) —
+nothing upstream (the agent's self-annotation format, the classifier's
+JSON schema) produces `claim_a`/`claim_b`/`what_is_blocked`/
+`what_resolves_it`, and `eventWriter.ts`'s `payload` was built as
+exactly `{ summary, confidence }`. Implementing the check literally
+as specified, without touching anything else, would have made
+CONTRADICTION and BLOCKER **permanently unwritable** — the new check's
+own required test case ("valid claim_a/claim_b gets accepted") would
+have been impossible to satisfy, since there'd be no way to get those
+values into `payload` at all. Flagged to the user via AskUserQuestion
+before proceeding; they chose to widen `payload`'s construction to
+include these fields when present on the incoming event (additive
+only — the existing summary/confidence behavior and the parameterized-
+JSON mechanism itself are unchanged), rather than ship validation logic
+that could never do anything but reject.
+
+**How**: extended `EventCandidate` (`responseParser.ts`) with 4 new
+*optional* fields — additive, doesn't affect any existing caller.
+Added `REQUIRED_FIELDS` map and the validation block to `eventWriter.ts`
+(placed right after `payload` is built, before the embedding call —
+so a rejected event never even pays for an embedding). On rejection:
+logs `schema_validation_failed` with the type and exactly which
+field(s) were missing/invalid, then `ROLLBACK`s and returns `null`
+(changed `writeEvent`'s return type from `{ eventId: string }` to
+`{ eventId: string } | null`; the only real caller, `agentPipe.ts`,
+never used the return value, so this needed no change there).
+
+Created a fresh session (`39f2128b-6c45-4120-8a2a-35bf27d20413`), wrote
+a temporary script (`testSchemaValidation.ts`, deleted after use) that
+called `eventWriter.writeEvent` directly (bypassing the classifier,
+same pattern as every other eventWriter test in this file) for all 5
+required cases, then queried `events` via psql. Session deleted
+afterward.
+
+**Results**: all 5 passed exactly as specified.
+- CONTRADICTION missing `claim_a` → rejected, logged
+  `invalid/missing field(s): claim_a`, not inserted.
+- CONTRADICTION with `claim_a` pointing at a nonexistent event id →
+  rejected the same way, not inserted.
+- CONTRADICTION with real, existing `claim_a`/`claim_b` → accepted;
+  psql confirmed the row exists with
+  `payload = {"claim_a": "evt_...", "claim_b": "evt_...", "summary":
+  ..., "confidence": "high"}`.
+- BLOCKER missing `what_resolves_it` → rejected, not inserted.
+- FINDING with only the common fields → accepted normally,
+  `payload = {"summary": ..., "confidence": "low"}`, confirming
+  untyped-requirement types are unaffected.
+
+A final psql count on the test session showed exactly 4 rows (2 setup
+FINDINGs + the 1 accepted CONTRADICTION + the 1 accepted FINDING) —
+the 3 rejected attempts (2× CONTRADICTION, 1× BLOCKER) never touched
+the table, confirmed by row count as well as by each individual result.
+
+**Not fixed / still true after this task**: the real agent → classifier
+pipeline still cannot produce `claim_a`/`claim_b`/`what_is_blocked`/
+`what_resolves_it` for a live CONTRADICTION or BLOCKER — this task only
+added the validation layer and the minimum payload-plumbing needed to
+make it testable, not the upstream wiring (self-annotation format,
+classifier prompt/schema) that would let a real agent response ever
+populate these fields. Until that separate, out-of-scope work happens,
+every real CONTRADICTION/BLOCKER the classifier emits will be rejected
+by this new check — which is arguably correct today (undefined
+"claims" shouldn't be inserted) but is worth knowing before assuming
+this feature is fully wired end-to-end.

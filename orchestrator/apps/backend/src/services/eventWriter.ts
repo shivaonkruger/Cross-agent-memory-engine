@@ -5,9 +5,17 @@ import type { EventCandidate } from "./responseParser";
 
 const EVENT_WINDOW_CAP = 20;
 
-// Starting guess, NOT a tuned value — pending review of real similarity
-// scores logged below (see the TEMP threshold-tuning block in writeEvent).
-const CORROBORATION_THRESHOLD = 0.85;
+
+const CORROBORATION_THRESHOLD = 0.8;
+
+// Second validation layer, on top of the type/summary check the classifier
+// already enforces before an event ever reaches here. Only these two types
+// carry extra required fields right now; a type not listed here has no
+// extra requirements and skips this check entirely.
+const REQUIRED_FIELDS: Record<string, string[]> = {
+  CONTRADICTION: ["claim_a", "claim_b"],
+  BLOCKER: ["what_is_blocked", "what_resolves_it"],
+};
 
 interface CorroborationCandidate {
   id: string;
@@ -22,19 +30,11 @@ interface ShortTermMemoryRow {
   pending_questions: string[];
 }
 
-/**
- * Writes a classifier-validated event: inserts the real events-table row
- * (source of truth), links it to whatever it resolves, and refreshes
- * short_term_memory's event_window/agent_states/pending_questions (the
- * denormalized read cache) — all inside one transaction. Throws (after
- * rolling back) rather than swallowing a failure, so the caller knows the
- * write did not happen.
- */
 export async function writeEvent(
   sessionId: string,
   agent: string,
   event: EventCandidate
-): Promise<{ eventId: string }> {
+): Promise<{ eventId: string } | null> {
   const eventId = `evt_${nanoid(8)}`;
   const requiresResponse = event.type === "QUESTION";
 
@@ -42,16 +42,7 @@ export async function writeEvent(
   try {
     await client.query("BEGIN");
 
-    // The classifier's `resolves` comes from an LLM and cannot be trusted
-    // as-is: it can hallucinate an id that doesn't exist, reference a real
-    // event belonging to a DIFFERENT session, point at something that isn't
-    // even a QUESTION, or re-target a QUESTION that's already resolved.
-    // Whether this response's reasoning actually answers that question is
-    // unavoidably the model's judgment call — but whether the target is
-    // real, ours, the right type, and still open is pure state safety, and
-    // gets enforced here before anything touches the database. An invalid
-    // reference is stripped and logged, never allowed to corrupt the graph
-    // and never allowed to fail the write.
+
     let validatedResolves: string | null = null;
     if (event.resolves) {
       const targetCheck = await client.query(
@@ -75,22 +66,47 @@ export async function writeEvent(
         validatedResolves = event.resolves;
       }
     }
+    const payload: Record<string, unknown> = { summary: event.summary, confidence: event.confidence || null };
+    if (event.claim_a !== undefined) payload.claim_a = event.claim_a;
+    if (event.claim_b !== undefined) payload.claim_b = event.claim_b;
+    if (event.what_is_blocked !== undefined) payload.what_is_blocked = event.what_is_blocked;
+    if (event.what_resolves_it !== undefined) payload.what_resolves_it = event.what_resolves_it;
 
-    // `summary`/`confidence` are duplicated into payload deliberately, not
-    // by accident: they already have their own dedicated columns above, but
-    // EventCandidate currently carries no type-specific data at all (no
-    // OUTPUT code, no HANDOFF target agent — nothing upstream produces
-    // those fields yet). This makes the INSERT genuinely dynamic/
-    // parameterized instead of a hardcoded '{}' literal, so real per-type
-    // fields slot in here later without touching this query again — it is
-    // NOT yet capturing anything not already stored elsewhere in the row.
-    const payload = { summary: event.summary, confidence: event.confidence || null };
+    const requiredFields = REQUIRED_FIELDS[event.type];
+    if (requiredFields) {
+      const invalidFields: string[] = [];
+      for (const field of requiredFields) {
+        const value = payload[field];
+        if (typeof value !== "string" || !value.trim()) {
+          invalidFields.push(field);
+        }
+      }
 
-    // Corroboration: does this event match something a DIFFERENT agent
-    // already said in this session? Applies to every event type, no
-    // filtering — the spec explicitly asked for that. Cross-session
-    // matching and same-agent matching are both deliberately excluded (an
-    // agent shouldn't be able to "corroborate" itself).
+      // claim_a/claim_b aren't just required to be non-empty — they must
+      // reference real events in this session, not any arbitrary string.
+      if (event.type === "CONTRADICTION") {
+        for (const field of ["claim_a", "claim_b"]) {
+          if (invalidFields.includes(field)) continue;
+          const targetId = payload[field] as string;
+          const targetCheck = await client.query(
+            "SELECT 1 FROM events WHERE id = $1 AND session_id = $2 AND deleted_at IS NULL",
+            [targetId, sessionId]
+          );
+          if (targetCheck.rows.length === 0) {
+            invalidFields.push(field);
+          }
+        }
+      }
+
+      if (invalidFields.length > 0) {
+        console.warn(
+          `eventWriter: schema_validation_failed — type=${event.type}, invalid/missing field(s): ${invalidFields.join(", ")}`
+        );
+        await client.query("ROLLBACK");
+        return null;
+      }
+    }
+
     const embedding = await getEmbedding(event.summary);
     const vectorLiteral = toVectorLiteral(embedding);
 
@@ -107,10 +123,7 @@ export async function writeEvent(
 
     const matchedIds: string[] = [];
     for (const candidate of candidatesResult.rows) {
-      // TEMP: threshold tuning, remove after tuning is done. Logs every
-      // similarity score this call actually computed (not just the ones
-      // that cleared the threshold) so real data can inform where
-      // CORROBORATION_THRESHOLD should actually land.
+
       console.log(
         `corroboration-tuning: new="${event.summary}" (agent=${agent}) vs ` +
           `existing="${candidate.summary}" (id=${candidate.id}, agent=${candidate.agent}) ` +

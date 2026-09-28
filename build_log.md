@@ -687,6 +687,184 @@ the old and new images) is cosmetic so far but unaddressed.
 
 ---
 
+## Phase 12 — Stop response (cancel in-flight agent request)
+
+**Goal**: let the user cancel a message mid-flight instead of waiting
+for it to run to completion, and make sure a cancelled response is
+fully discarded — never written to `messages` or `events`.
+
+**What was built**:
+- `agentPipe.ts`: `sendAgentMessage` now takes an optional `signal`,
+  passed into the OpenRouter `chat.completions.create` call as
+  `{ signal }`; `withRetry`'s `shouldRetry` short-circuits on
+  `signal.aborted` so an aborted call is never retried; a check for
+  `signal.aborted` immediately after the `await` resolves (covering the
+  race where OpenRouter finishes right as the client disconnects)
+  throws an `AbortError`-shaped `DOMException`, so the discard path is
+  identical whether the abort happened mid-call or right after; the
+  outer `catch` distinguishes an aborted call (logged, not treated as a
+  failure) from a genuine one
+- `routes/agents.ts`: `POST /message` now creates a per-request
+  `AbortController` and listens for `req.on("close")` to abort it the
+  moment the client disconnects (stop button, navigation, tab close);
+  its `catch` block checks `controller.signal.aborted` to respond with
+  a clean no-op instead of a 500
+- Frontend: `AgentPanel.tsx`'s Send button swaps to a Stop button
+  (same position) while a response is pending; an `AbortController` is
+  created per send and kept in a ref; Stop calls `.abort()` and
+  immediately clears the pending/typing-indicator state rather than
+  waiting for the rejection to propagate; `api/client.ts`'s
+  `sendAgentMessage` forwards an optional `AbortSignal` into the fetch
+  call
+- Discard semantics fall out of existing ordering, not an extra
+  deletion step: the user's own prompt is inserted into `messages`
+  *before* the OpenRouter call, same as always, so it survives an
+  abort; the assistant message and any classifier/eventWriter side
+  effects only ever run after a successful, non-aborted completion
+
+**Key decisions**:
+- Scoped as cancel-the-in-flight-request, not real token streaming —
+  the app has no SSE/`stream: true` anywhere; `POST /api/agents/message`
+  is (and remains) a single blocking call. This was an explicit,
+  confirmed scope choice, not an assumption made along the way
+- The post-completion abort race is handled by re-checking
+  `signal.aborted` once more right after the `await` resolves, before
+  any DB write happens — not left to chance
+- Retries are disabled once aborted
+  (`shouldRetry: (err) => !signal?.aborted && isRetryableOpenRouterError(err)`)
+  — retrying after the client is already gone would just pay for a
+  generation nobody will read
+
+**Verified**: tests.md Test 5 — a real dropped connection (curl
+`--max-time 1` against a prompt long enough to still be in flight),
+not a simulated one. Along the way, found and killed a stale leftover
+backend process from earlier dev work that was still bound to port
+3000 serving pre-fix code, then restarted cleanly. Confirmed via live
+console output and psql: the user's message was saved, zero assistant
+messages and zero events were written, no crash, clean abort logged on
+both the server's `req.on("close")` path and its `catch` block. Ran
+twice for consistency.
+
+**Deferred at this stage**: the frontend half (the Stop button click,
+the `AbortError` branch in `AgentPanel`'s `catch`) was not
+independently click-tested in a browser this round — verified by code
+reading and consistency with an already-proven pattern elsewhere in
+this project (`ConfirmDialog`'s Escape handling); real token-level
+streaming remains unbuilt — this only cancels a blocking request, it
+doesn't add incremental rendering.
+
+---
+
+## Phase 13 — Named sessions (create-with-name + rename)
+
+**Goal**: give sessions a real, user-chosen name instead of only a raw
+UUID and a timestamp — set at creation time via a popup, and editable
+afterward from the session list.
+
+**What was built**:
+- Migration `010_add_session_name.sql`: `sessions.name TEXT NOT NULL
+  DEFAULT 'New session'` — the default exists only to backfill
+  pre-existing rows; every session created going forward always passes
+  a real name explicitly
+- `sessionsService.ts`: `createSession(userId, name)` now takes and
+  stores a name; `listActiveSessions` returns it; new
+  `renameSession(sessionId, userId, name)` — same ownership +
+  not-deleted guard as `deleteSession`, returns the updated `Session`
+  or `null`
+- `routes/sessions.ts`: `POST /` now accepts an optional `name` in the
+  body (empty/whitespace rejected with 400, omitted falls back to
+  `"New session"` server-side); new `PATCH /:sessionId` (`name`
+  required, 400 if empty/whitespace, 404 on not-found-or-not-yours,
+  same pattern as the other routes in this file)
+- Frontend: new `NewSessionModal.tsx` (modeled on `ConfirmDialog`) —
+  pre-filled text input (`"New session"`, auto-selected), Enter
+  confirms, Escape cancels, Create button disabled while empty;
+  `SessionListPage.tsx` now opens this modal on "New session" instead
+  of creating immediately, and wires a `handleRename` that calls the
+  new endpoint and updates local state
+- `SessionListItem.tsx`: the session name is now the primary displayed
+  line (the raw UUID display was dropped); rename triggers via either
+  double-clicking the name or a new pencil-icon button; triggering it
+  swaps the name for an inline `<input>` pre-filled with the current
+  name — Enter or blur saves, Escape reverts; a `settledRef` guard
+  prevents Enter's commit and the blur it triggers from double-firing
+- `api/client.ts`: `createSession(name)` and new
+  `renameSession(sessionId, name)`
+- `Session` type (both frontend and backend `types/shared.ts` — still
+  duplicated files, not a shared package) gained a `name: string` field
+
+**Key decisions**:
+- Validation is deliberately handled differently at each layer rather
+  than one shared mechanism: the backend rejects empty/whitespace
+  outright (400, nothing written); the inline rename UI silently
+  reverts to the previous name on an empty/unchanged value (no request
+  sent); the creation modal simply disables its Create button while
+  empty. Each is the natural fit for its own interaction shape, not an
+  inconsistency
+- No uniqueness enforcement on names, as specified — duplicates are
+  fine
+
+**Verified**: tests.md Test 6 — migration applied to the live dev DB;
+exercised all 7 paths directly against the running backend: create
+with an explicit name, list reflecting it, rename, rename-with-
+whitespace (400), create-with-empty-string (400), create-with-no-
+name-field (server default applied), and rename of a nonexistent/
+not-owned session (404). All passed exactly as implemented. Test
+sessions cleaned up afterward.
+
+**Deferred at this stage**: the actual browser UI — the modal's
+keyboard handling, the double-click/pencil-icon rename trigger, and
+the Enter/Escape/blur interplay in the inline editor — was not
+independently click-tested this round; verified by code reading and
+consistency with the already-proven `ConfirmDialog` pattern.
+
+---
+
+## Phase 14 — Prompt box: auto-grow + Shift+Enter for newline
+
+**Goal**: fix two rough edges in the chat input — it was a fixed
+single-line `<input>` that couldn't show a multi-line draft, and Enter
+was the only way to end a line, with no way to insert a line break
+without sending.
+
+**What was built**:
+- `AgentPanel.tsx`: the message input is now a `<textarea>` instead of
+  an `<input>`. A `useLayoutEffect` keyed on the input value collapses
+  the box to `height: auto`, measures `scrollHeight`, then sets height
+  to `min(scrollHeight, 200px)` — capping growth at roughly 8-10 lines
+  and switching to internal scrolling (`overflowY: auto`) past that
+  point. Because it's keyed on the same `input` state that already gets
+  reset to `""` on send, the same logic naturally collapses the box
+  back down after sending — no separate reset code needed
+- Keydown handling: plain Enter still calls `preventDefault()` and
+  sends, same as before; Shift+Enter is left completely unhandled so
+  the textarea's native newline-insert behavior happens on its own
+- The input row gained `items-end` so the Send/Stop button stays
+  bottom-anchored instead of stretching to match the growing
+  textarea's height
+
+**Key decisions**:
+- `useLayoutEffect`, not `useEffect`, specifically to avoid a visible
+  resize flash — it runs before the browser paints, in the same frame
+  as the state update
+- Collapsing to `height: auto` before measuring is what allows the box
+  to shrink back down when text is deleted — without it, `scrollHeight`
+  would still reflect the box's previous, larger explicit height
+
+**Verified**: `tsc --noEmit` and a full production `vite build` both
+clean. **This was NOT click-tested in an actual browser** — no
+browser-automation tool is available in this environment. Recorded
+plainly in tests.md Test 7 rather than glossed over: three of the four
+spec requirements (no page-jump, shrink-on-delete, reset-after-send)
+are specifically about runtime visual behavior that a type/build check
+cannot verify.
+
+**Deferred at this stage**: real in-browser confirmation of smooth
+growth/shrink, no page-jump, and Shift+Enter actually inserting a
+newline instead of sending — none of this has been watched happen yet.
+
+---
+
 ## Next up (not yet built — do not treat as done)
 
 Compression engine / tiering system. `events.tier` and

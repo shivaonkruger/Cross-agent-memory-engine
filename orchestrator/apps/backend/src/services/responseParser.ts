@@ -3,6 +3,15 @@ export interface EventCandidate {
   summary: string;
   confidence: string;
   resolves: string | null;
+  // Per-type required fields (see eventWriter.ts's REQUIRED_FIELDS) —
+  // optional here since only CONTRADICTION/BLOCKER use them, and nothing
+  // upstream (self-annotation parsing, the classifier's JSON schema)
+  // populates them yet. A direct writeEvent() caller (e.g. a test) can set
+  // them; the real agent/classifier pipeline does not, for now.
+  claim_a?: string;
+  claim_b?: string;
+  what_is_blocked?: string;
+  what_resolves_it?: string;
 }
 
 export interface ParsedAgentResponse {
