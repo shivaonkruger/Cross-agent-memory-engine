@@ -154,3 +154,51 @@ way, the fix is correct and necessary — this only refines *why*.
 to Phase 8, not a new capability, so it won't get its own build_log.md
 phase. Pending the user's confirmation, it becomes a dated addendum
 inside Phase 8's entry instead.
+
+---
+
+## Test 3 — eventWriter.ts `payload` fix verification (2026-09-28)
+
+**What was tested**: a fix making `events.payload` a real, parameterized
+JSONB value instead of a hardcoded `'{}'::jsonb` literal.
+
+**Why**: requested as a bug fix ("real data going into payload instead
+of an empty object"), but a read-only audit performed first (per the
+task's own step 1) found the premise didn't fully hold — see finding
+below. User chose, when asked, to mirror `EventCandidate`'s existing
+fields into payload rather than extend the pipeline to capture genuinely
+new per-type data.
+
+**How**: created a fresh session (`d2607523-aa68-4c2f-beb0-dd20ae2761f7`),
+wrote a temporary script (`testPayloadFix.ts`, deleted after use) that
+called `eventWriter.writeEvent` directly for two different event types
+(DECISION, QUESTION), then queried the `events` table via psql to
+inspect the actual `payload` values. Session and its data deleted
+afterward.
+
+**Results**: both events had a distinct, non-empty `payload` matching
+their own `summary`/`confidence` — `{"summary": "test decision for
+payload verification", "confidence": "high"}` and `{"summary": "test
+question for payload verification", "confidence": "low"}` respectively.
+Confirms the INSERT is now genuinely parameterized (not the old literal)
+and varies per call.
+
+**A finding worth recording** (surfaced during the read-only audit
+requested before this fix, not during this test itself): `EventCandidate`
+— the only object `writeEvent` ever receives — has exactly four fields
+(`type`, `summary`, `confidence`, `resolves`), and **all four already
+have their own dedicated columns** in `events`. So `payload = {}` was not
+actually discarding any real data; there was never any type-specific
+information (e.g. OUTPUT's code, HANDOFF's target agent) produced
+anywhere upstream to discard in the first place — the original Phase 8
+spec even called this out explicitly as a deliberate deferral, not an
+oversight. This fix is therefore honestly a duplication of
+`summary`/`confidence` into a dynamic, forward-compatible slot — not a
+recovery of previously-lost data. Genuine per-type richness would
+require new upstream work (threading the raw response or a parsed
+target-agent through `responseParser.ts`/`agentPipe.ts`), which was
+explicitly out of scope for this fix.
+
+**Logging note**: per the task's own instructions, this is a correction
+to Phase 8, not a new capability. Pending the user's confirmation, it
+becomes a dated addendum inside Phase 8's entry.

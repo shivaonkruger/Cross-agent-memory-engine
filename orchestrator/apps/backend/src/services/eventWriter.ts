@@ -64,9 +64,19 @@ export async function writeEvent(
       }
     }
 
+    // `summary`/`confidence` are duplicated into payload deliberately, not
+    // by accident: they already have their own dedicated columns above, but
+    // EventCandidate currently carries no type-specific data at all (no
+    // OUTPUT code, no HANDOFF target agent — nothing upstream produces
+    // those fields yet). This makes the INSERT genuinely dynamic/
+    // parameterized instead of a hardcoded '{}' literal, so real per-type
+    // fields slot in here later without touching this query again — it is
+    // NOT yet capturing anything not already stored elsewhere in the row.
+    const payload = { summary: event.summary, confidence: event.confidence || null };
+
     await client.query(
       `INSERT INTO events (id, session_id, type, agent, summary, confidence, resolves, requires_response, payload)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '{}'::jsonb)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
       [
         eventId,
         sessionId,
@@ -76,6 +86,7 @@ export async function writeEvent(
         event.confidence || null,
         validatedResolves,
         requiresResponse,
+        JSON.stringify(payload),
       ]
     );
 
